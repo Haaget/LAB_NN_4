@@ -1,91 +1,129 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from tensorflow.keras.models import Sequential, Model
-from tensorflow.keras.layers import Dense, LeakyReLU, Reshape, Flatten, BatchNormalization, Conv2D, Conv2DTranspose, Input
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.datasets import mnist
+import tensorflow as tf
+from tensorflow.keras import layers
 
-def build_generator(latent_dim):
-    model = Sequential()
-    model.add(Dense(128 * 7 * 7, input_dim=latent_dim))
-    model.add(LeakyReLU(alpha=0.2))
-    model.add(Reshape((7, 7, 128)))
-    model.add(Conv2DTranspose(64, kernel_size=3, strides=2, padding='same'))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=0.2))
-    model.add(Conv2DTranspose(32, kernel_size=3, strides=2, padding='same'))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=0.2))
-    model.add(Conv2DTranspose(16, kernel_size=3, strides=1, padding='same'))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=0.2))
-    model.add(Conv2DTranspose(1, kernel_size=3, activation='tanh', padding='same'))
+# Завантаження MNIST
+(X_train, _), (_, _) = tf.keras.datasets.mnist.load_data()
+X_train = X_train.astype("float32") / 255.0
+X_train = np.expand_dims(X_train, axis=-1)  # (60000, 28, 28, 1)
+
+BUFFER_SIZE = 60000
+BATCH_SIZE = 128
+LATENT_DIM = 100
+EPOCHS = 500
+SAVE_INTERVAL = 100
+
+# Побудова генератора
+def build_generator():
+    model = tf.keras.Sequential()
+    model.add(layers.Dense(7*7*256, use_bias=False, input_shape=(LATENT_DIM,)))
+    model.add(layers.BatchNormalization())
+    model.add(layers.LeakyReLU())
+    model.add(layers.Reshape((7, 7, 256)))  # (7,7,256)
+
+    model.add(layers.Conv2DTranspose(128, (5,5), strides=(1,1), padding='same', use_bias=False))
+    model.add(layers.BatchNormalization())
+    model.add(layers.LeakyReLU())
+
+    model.add(layers.Conv2DTranspose(64, (5,5), strides=(2,2), padding='same', use_bias=False))
+    model.add(layers.BatchNormalization())
+    model.add(layers.LeakyReLU())
+
+    model.add(layers.Conv2DTranspose(1, (5,5), strides=(2,2), padding='same', use_bias=False, activation='sigmoid'))
+
     return model
 
-def build_discriminator(input_shape):
-    model = Sequential()
-    model.add(Conv2D(64, kernel_size=3, strides=2, padding='same', input_shape=input_shape))
-    model.add(LeakyReLU(alpha=0.2))
-    model.add(Conv2D(128, kernel_size=3, strides=2, padding='same'))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=0.2))
-    model.add(Conv2D(256, kernel_size=3, strides=2, padding='same'))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=0.2))
-    model.add(Flatten())
-    model.add(Dense(1, activation='sigmoid'))
+# Побудова дискримінатора
+def build_discriminator():
+    model = tf.keras.Sequential()
+    model.add(layers.Conv2D(64, (5,5), strides=(2,2), padding='same', input_shape=[28,28,1]))
+    model.add(layers.LeakyReLU())
+    model.add(layers.Dropout(0.3))
+
+    model.add(layers.Conv2D(128, (5,5), strides=(2,2), padding='same'))
+    model.add(layers.LeakyReLU())
+    model.add(layers.Dropout(0.3))
+
+    model.add(layers.Flatten())
+    model.add(layers.Dense(1, activation='sigmoid'))
+
     return model
 
-def build_gan(generator, discriminator):
-    discriminator.compile(loss='binary_crossentropy', optimizer=Adam(0.0001, 0.5), metrics=['accuracy'])
-    discriminator.trainable = False
-    gan_input = Input(shape=(100,))
-    fake_image = generator(gan_input)
-    gan_output = discriminator(fake_image)
-    model = Model(gan_input, gan_output)
-    model.compile(loss='binary_crossentropy', optimizer=Adam(0.0002, 0.5))
-    return model
+# Створення моделей
+generator = build_generator()
+discriminator = build_discriminator()
 
-def train_gan(generator, discriminator, gan, epochs=500, batch_size=128):
-    (X_train, _), _ = mnist.load_data()
-    X_train = X_train / 127.5 - 1.0
-    X_train = np.expand_dims(X_train, axis=-1)
+# Оптимізатори
+cross_entropy = tf.keras.losses.BinaryCrossentropy()
+generator_optimizer = tf.keras.optimizers.Adam(1e-4)
+discriminator_optimizer = tf.keras.optimizers.Adam(1e-4)
 
-    real = np.ones((batch_size, 1))
-    fake = np.zeros((batch_size, 1))
+# Мітки
+real_label = tf.ones((BATCH_SIZE, 1))
+fake_label = tf.zeros((BATCH_SIZE, 1))
 
-    for epoch in range(epochs):
-        idx = np.random.randint(0, X_train.shape[0], batch_size)
-        real_images = X_train[idx]
+# Пайплайн даних
+dataset = tf.data.Dataset.from_tensor_slices(X_train).shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
 
-        noise = np.random.normal(0, 1, (batch_size, 100))
-        fake_images = generator.predict(noise)
+# Тренувальний цикл
+@tf.function
+def train_step(images):
+    noise = tf.random.normal([BATCH_SIZE, LATENT_DIM])
 
-        d_loss_real = discriminator.train_on_batch(real_images, real)
-        d_loss_fake = discriminator.train_on_batch(fake_images, fake)
-        d_loss = [(d_loss_real[0] + d_loss_fake[0]) / 2, (d_loss_real[1] + d_loss_fake[1]) / 2]
+    # Тренування дискримінатора
+    with tf.GradientTape() as disc_tape:
+        generated_images = generator(noise, training=True)
 
-        noise = np.random.normal(0, 1, (batch_size, 100))
-        g_loss = gan.train_on_batch(noise, real)
-        print(f"Epoch {epoch+1}/{epochs} | D Loss: {d_loss[0]:.4f}, D Acc: {d_loss[1]:.4f} | G Loss: {g_loss:.4f}")
+        real_output = discriminator(images, training=True)
+        fake_output = discriminator(generated_images, training=True)
 
-def generate_and_save_images(generator, num_examples=10):
-    noise = np.random.normal(0, 1, (num_examples, 100))
-    gen_images = generator.predict(noise)
-    gen_images = (gen_images + 1) / 2.0
+        disc_loss = cross_entropy(real_label, real_output) + cross_entropy(fake_label, fake_output)
 
-    plt.figure(figsize=(10, 2))
-    for i in range(num_examples):
-        plt.subplot(1, num_examples, i+1)
-        plt.imshow(gen_images[i, :, :, 0], cmap='gray')
+    grads_disc = disc_tape.gradient(disc_loss, discriminator.trainable_variables)
+    discriminator_optimizer.apply_gradients(zip(grads_disc, discriminator.trainable_variables))
+
+    # Тренування генератора
+    noise = tf.random.normal([BATCH_SIZE, LATENT_DIM])
+    with tf.GradientTape() as gen_tape:
+        generated_images = generator(noise, training=True)
+        fake_output = discriminator(generated_images, training=True)
+        gen_loss = cross_entropy(real_label, fake_output)
+
+    grads_gen = gen_tape.gradient(gen_loss, generator.trainable_variables)
+    generator_optimizer.apply_gradients(zip(grads_gen, generator.trainable_variables))
+
+    real_accuracy = tf.reduce_mean(tf.cast(real_output > 0.5, tf.float32))
+    fake_accuracy = tf.reduce_mean(tf.cast(fake_output < 0.5, tf.float32))
+    disc_accuracy = (real_accuracy + fake_accuracy) / 2
+
+    # Рахуємо точність генератора (як кількість "реальних" згенерованих зображень)
+    gen_accuracy = tf.reduce_mean(tf.cast(fake_output > 0.5, tf.float32))
+
+    return gen_loss, disc_loss, disc_accuracy, gen_accuracy
+
+# Візуалізація
+def generate_and_save_images(model, epoch):
+    test_input = tf.random.normal([16, LATENT_DIM])
+    predictions = model(test_input, training=False)
+
+    fig = plt.figure(figsize=(4,4))
+    for i in range(predictions.shape[0]):
+        plt.subplot(4, 4, i+1)
+        plt.imshow(predictions[i, :, :, 0], cmap='gray')
         plt.axis('off')
-        
-latent_dim = 100
-generator = build_generator(latent_dim)
-discriminator = build_discriminator((28, 28, 1))
-gan = build_gan(generator, discriminator)
-train_gan(generator, discriminator, gan)
 
-generate_and_save_images(generator)
-generator.save("generator_model.h5")
-plt.show()
+    plt.tight_layout()
+    plt.savefig(f'gan_mnist_epoch_{epoch}.png')
+    plt.close()
+
+# Навчання
+for epoch in range(1, EPOCHS+1):
+    for image_batch in dataset:
+        gen_loss, disc_loss, disc_accuracy, gen_accuracy = train_step(image_batch)
+
+    print(f"Epoch {epoch}, Generator Loss: {gen_loss:.4f}, Discriminator Loss: {disc_loss:.4f}, "
+          f"Discriminator Accuracy: {disc_accuracy:.4f}, Generator Accuracy: {gen_accuracy:.4f}")
+
+    if epoch % SAVE_INTERVAL == 0 or epoch == 1:
+        generate_and_save_images(generator, epoch)
